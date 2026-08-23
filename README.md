@@ -13,6 +13,7 @@
     
     Usage:
       clone_system_disk_to_ssh.sh [OPTIONS]... SOURCE_DISK... SSH_USER... SSH_HOST... DESTINATION_DIRECTORY
+      don't run it with sudo privileges.
     
     Run as root or with sudo privileges. The source must be a block device, and the local
     image directory and remote destination directory must already exist.
