@@ -1,7 +1,13 @@
 #!/bin/bash
-SCRIPT_VERSION="0.1.1"
+SCRIPT_VERSION="0.1.3"
+#FIXME UNSAFE/SAFE mode doesn't work properly, because of variable initialization. Check also the other variable initializations.
 
 function main()  {
+    
+    UNSAFE=false #used to initialize the variable to false.
+    KEEP_LOCAL_IMAGE=false
+    VERBOSE=false
+    LOG=false
     
     # Clone a disk or partition to a compressed image and transfer it to a remote host over SSH.
     #
@@ -16,18 +22,21 @@ function main()  {
     # - Provides --help and --version options for command usage and release information.
     #
     # Usage:
-    #   sudo clone_system_disk_to_ssh.sh [OPTIONS] SOURCE_DISK SSH_USER SSH_HOST DESTINATION_DIRECTORY
+    #   clone_system_disk_to_ssh.sh [OPTIONS] SOURCE_DISK SSH_USER SSH_HOST DESTINATION_DIRECTORY
     #
     # Run as root or with sudo privileges. The source must be a block device, and the local
     # image directory and remote destination directory must already exist.
 
     parse_arguments "$@" # parse command-line arguments and set variables accordingly
-    verify_command dd pigz rsync ssh md5sum openssh-client ssh-keyscan ssh-keygen # verify that the required commands are available on the system. If any command is missing, log the error and exit the script.
+    cache_sudo_pwd
+    verify_package coreutils openssh-client pigz rsync
+    verify_command dd pigz rsync ssh md5sum ssh-keyscan ssh-keygen # verify that the required commands are available on the system. If any command is missing, log the error and exit the script.
     if [[ -z "$SSH_KEY_NAME" ]]; then
         generate_ssh_key  # generate an SSH key pair if it does not already exist. Prompt the user for a custom key name and create the key in ~/.ssh.
     fi
     verify_ssh_connection  # verify ssh connection and access to the remote CONNECTION and the backup directory before proceeding with the backup process. If the connection fails or the directory is not accessible, log the error and exit the script.
     clone_disk_to_image  # create a disk image of the specified source disk using dd. Save it to a local file with a timestamped name in the specified backup directory. Ensure that the output file is created on a disk different from the source disk. Ensure that the dd command is executed with appropriate permissions and error handling.
+	echo "UNSAFE : $UNSAFE"    
     if [[ "$UNSAFE" == false ]]; then
         verify_local_md5sum  # verify the integrity of the image file by comparing md5 checksums of the disk of origin and the local image file.
     else
@@ -45,7 +54,10 @@ function main()  {
 function parse_arguments() {
     
     POSITIONAL_ARGS=() # used in case arguments are space separated and not prefixed with a flag. 
+    
     CACHE_LOG="" # used to store log messages for later output before log file is created.
+    
+
 
     while [[ $# -gt 0 ]]; do
         #During each iteration of the loop, the shift command is used to shift the 
@@ -56,8 +68,8 @@ function parse_arguments() {
        
         case "$1" in
             -h|--help)
-                echo "Usage: $0 [OPTIONS]... SOURCE_DISK... SSH_USER... SSH_HOST... DESTINATION_DIRECTORY"
-                echo "or: [OPTIONS]... SOURCE_DISK... SSH_USER... SSH_HOST... DESTINATION_DIRECTORY... -l|--local-image LOCAL_IMAGE_DIRECTORY"
+                echo "Usage: [OPTIONS]... SOURCE_DISK... SSH_USER... SSH_HOST... DESTINATION_DIRECTORY"
+                echo "or: [OPTIONS]... -l|--local-image LOCAL_IMAGE_DIRECTORY... SOURCE_DISK... SSH_USER... SSH_HOST... DESTINATION_DIRECTORY"
                 echo "Options:"
                 echo "  -h, --help     Show this help message and exit"
                 echo "  -c, --compression-level  Specify the compression level for pigz (1-9)"
@@ -146,10 +158,8 @@ function parse_arguments() {
     cache_print "Positional arguments: $@"
 
     SOURCE_DISK=$(check_mandatory_argument "$1" "SOURCE_DISK")
-    check_mandatory_argument "$2" "SSH_USER"
-    SSH_USER="$2"
-    check_mandatory_argument "$3" "SSH_HOST"
-    SSH_HOST="$3"
+    SSH_USER=$(check_mandatory_argument "$2" "SSH_USER")
+    SSH_HOST=$(check_mandatory_argument "$3" "SSH_HOST")
     CONNECTION_CREDENTIALS="$2@$3"  # combine SSH_USER and SSH_HOST into CONNECTION_CREDENTIALS
     DESTINATION_DIRECTORY=$(check_mandatory_argument "$4" "DESTINATION_DIRECTORY")
     if [[ "$UNSAFE" == true ]]; then
@@ -165,6 +175,7 @@ function parse_arguments() {
             verbose_log "$CACHE_LOG"  # print cached log messages to the console and append them to the log file
     fi
     
+    #TODO list on the screen all the global variables.
     verbose_log "$(basename "$0") version $SCRIPT_VERSION"
     verbose_log "SOURCE_DISK: $SOURCE_DISK"
     verbose_log "CONNECTION_CREDENTIALS: $CONNECTION_CREDENTIALS"
@@ -223,7 +234,7 @@ function clone_disk_to_image() {
     # Create a disk image using dd
     verbose_log "Creating disk image of $SOURCE_DISK..."
     #don't pipe the output to pigz, instead create the image first and then compress it. This allows for better error handling and verification of the image before compression. conv=sync if piped to pigz could cause data loss if the pipe is broken or if pigz stutters. 
-    if ! sudo dd if="$SOURCE_DISK" of="${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}" bs=4M status=progress conv=noerror,sync iflag=noatime; then
+    if ! printf '%s\n' "$SUDO_PWD" | sudo -S dd if="$SOURCE_DISK" of="${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}" bs=4M status=progress conv=noerror,sync iflag=noatime; then
         verbose_log "Error: Failed to create disk image."
         exit 1
     fi
@@ -237,23 +248,26 @@ function check_mandatory_argument() {
         cache_print "Error: $2 is a mandatory argument."
         exit 1
     fi
-    cache_print "$1"
+    
+    echo "$1"
 }
 
 function verify_local_md5sum() {
+    verbose_log "verifying the image file..."
+    local sum_source=$(printf '%s\n' "$SUDO_PWD" | sudo -S md5sum "${SOURCE_DISK}" | cut -d' ' -f1)
     local sum_image=$(md5sum "${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}" | cut -d' ' -f1)
-    local sum_source=$(md5sum "${SOURCE_DISK}" | cut -d' ' -f1)
     verbose_log "MD5 checksum of the image file: $sum_image"
     verbose_log "MD5 checksum of the source disk: $sum_source"
     if [[ "$sum_image" != "$sum_source" ]]; then
         verbose_log "Error: MD5 checksum verification failed. The image file may be corrupted."
         exit 1
     fi
-
+    sudo -k
     verbose_log "MD5 checksum verification passed. The image file is valid."
 }
 
 function verify_remote_md5sum() {
+    verbose_log "verifying the remote file..."
     # Verify the integrity of the transferred file by comparing md5 checksums of the local archive file and the remote archive file. If the checksums do not match, log the error and exit the script.
     local remote_sum=$(ssh "$SSH_KEY_NAME" "md5sum '$DESTINATION_DIRECTORY/${IMAGE_NAME}.gz' | cut -d' ' -f1")
     local local_sum=$(md5sum "${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.gz" | cut -d' ' -f1)
@@ -267,7 +281,7 @@ function verify_remote_md5sum() {
     else
 
     verbose_log "MD5 checksum verification passed. The transferred archive file is valid."
-    verbose_log "$SOURCE_DISK cloned successfully ${UNSAFE:+'(unsafe)'} and archived successfully as ${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.gz at ${SSH_KEY_NAME} ${CONNECTION_CREDENTIALS}"
+    verbose_log "$SOURCE_DISK cloned successfully and archived successfully as ${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.gz at ${SSH_KEY_NAME} ${CONNECTION_CREDENTIALS}"
 
         if rm "${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.gz"; then
             echo "Local compressed image file deleted successfully: ${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.gz"
@@ -336,6 +350,7 @@ function transfer_image_to_remote() {
 
     # Transfer the log file to the remote CONNECTION 
     if [[ "$LOG" == true ]]; then
+	verbose_log "transfering the log file to the remote destination..."
         if ! rsync -cavz -e ssh "${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.log" "$SSH_KEY_NAME:$DESTINATION_DIRECTORY"; then
             verbose_log "Error: Failed to transfer the log file to the remote $CONNECTION_CREDENTIALS."
         else
@@ -349,7 +364,6 @@ function cache_print() {
     # Cache print messages to the console for later output before log file is created.
     while [[ $# -gt 0 ]]; do
         CACHE_LOG+="$1"$'\n'
-        echo "$1"
         shift
     done
 }
@@ -388,18 +402,51 @@ function verbose_log() {
     print_verbose "${messages[@]}"
 }
 
+function cache_sudo_pwd() {
+        while true; do
+        read -r -s -p "Enter sudo password: " SUDO_PWD
+        printf '\n' >&2
+
+        if printf '%s\n' "$SUDO_PWD" | sudo -S -p '' -v; then
+            return 0
+        fi
+
+        printf '%s\n' "Incorrect sudo password." >&2
+    done
+}
+
 function verify_command() {
+    echo "verifying commands..."
     # Verify if a command exists. If not, print an error message and exit the script.
     while [[ $# -gt 0 ]]; do
         if ! command -v "$1" &> /dev/null; then
-            verbose_log "Error: $1 is not installed. Attempting to install via apt..."
-            if ! apt install "$1"; then
-                verbose_log "Error: Failed to install $1. Please install it manually and try again."
+            cache_print "Error: $1 is not installed. Please install it manually and try again."
+            exit 1
+        fi
+        shift
+    done
+
+    cache_print "all commands verified"
+}
+
+function verify_package() {
+    echo "verifying dependencies..."
+    while [[ $# -gt 0 ]]; do
+        if ! dpkg -s "$1" &> /dev/null; then
+            cache_print "Warning: $1 is not installed. Attempting to install via apt..."
+            echo "Warning: $1 is not installed. Attempting to install via apt..."
+            if ! sudo apt install "$1"; then
+                cache_print "Error: Failed to intall $1. Please install it manually and try again."
+                                echo "Error: Failed to intall $1. Please install it manually and try again."
+
+                sudo -k
                 exit 1
             fi
         fi
         shift
     done
+    sudo -k
+    cache_print "all dependencies verified"
 }
 
 function generate_ssh_key() {
