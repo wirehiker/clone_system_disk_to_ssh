@@ -1,6 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="0.1.3"
-#FIXME UNSAFE/SAFE mode doesn't work properly, because of variable initialization. Check also the other variable initializations.
+SCRIPT_VERSION="0.2.2"
 
 function main()  {
     
@@ -8,6 +7,7 @@ function main()  {
     KEEP_LOCAL_IMAGE=false
     VERBOSE=false
     LOG=false
+    READ_ONLY_SOURCE=false
     
     # Clone a disk or partition to a compressed image and transfer it to a remote host over SSH.
     #
@@ -29,10 +29,21 @@ function main()  {
 
     parse_arguments "$@" # parse command-line arguments and set variables accordingly
     cache_sudo_pwd
-    verify_package coreutils openssh-client pigz rsync
-    verify_command dd pigz rsync ssh md5sum ssh-keyscan ssh-keygen # verify that the required commands are available on the system. If any command is missing, log the error and exit the script.
+    verify_package coreutils openssh-client pigz rsync gddrescue
+    verify_command ddrescue pigz rsync ssh md5sum ssh-keyscan ssh-keygen # verify that the required commands are available on the system. If any command is missing, log the error and exit the script.
     if [[ -z "$SSH_KEY_NAME" ]]; then
         generate_ssh_key  # generate an SSH key pair if it does not already exist. Prompt the user for a custom key name and create the key in ~/.ssh.
+    fi
+    if [[ "$READ_ONLY_SOURCE" == true ]]; then
+        printf '%s\n' "$SUDO_PWD" | sudo -S -p '' blockdev --setro "$SOURCE_DISK" #sets a block device to read-only mode on Linux systems.
+        if printf '%s\n' "$SUDO_PWD" | sudo -S -p ''  blockdev --getro "$SOURCE_DISK"; then
+         #to confirm if it is read-only (returns 1) or read-write (returns 0)
+            verbose_log "$SOURCE_DISK is now read-only. At programm exit, write permissions will be recovered"
+            trap unlock_source EXIT
+        else
+            verbose_log "Failed to set read-only mode on $SOURCE_DISK. Unmount volume an attempt again or run as unsafe without read only mode"
+        fi
+        sudo -k
     fi
     verify_ssh_connection  # verify ssh connection and access to the remote CONNECTION and the backup directory before proceeding with the backup process. If the connection fails or the directory is not accessible, log the error and exit the script.
     clone_disk_to_image  # create a disk image of the specified source disk using dd. Save it to a local file with a timestamped name in the specified backup directory. Ensure that the output file is created on a disk different from the source disk. Ensure that the dd command is executed with appropriate permissions and error handling.
@@ -45,7 +56,9 @@ function main()  {
     compress_image  # compress the image file using pigz with the specified compression level and delete the uncompressed image file after successful compression. Ensure that the pigz command is executed with appropriate permissions and error handling.
     transfer_image_to_remote  # save it to the backup directory on the remote CONNECTION using rs
     verify_remote_md5sum  # verify the integrity of the transferred file by comparing md5 checksums of the local archive file and the remote archive file. If the checksums do not match, log the error and exit the script.
-
+    clean_local_files
+    
+    exit 1
 }
 
 ### FUNCTIONS ###
@@ -85,6 +98,7 @@ function parse_arguments() {
                 echo "  -l, --log      Enable logging"
                 # echo "  -q, --quiet    Enable quiet mode"
                 echo "  -v, --version  Show version information and exit"
+                echo "  -R, --read-only-source  Makes the source block device read-only for the time of execution"
                 exit 0
                 ;;
             -c|--compression-level)
@@ -128,6 +142,11 @@ function parse_arguments() {
             -l|--log)
                 LOG=true
                 cache_print "Log mode enabled"
+                shift
+                ;;
+            -R|--read-only-source)
+                READ_ONLY_SOURCE=true
+                cache_print "read only source enabled"
                 shift
                 ;;
             # -d|--debug)
@@ -234,7 +253,12 @@ function clone_disk_to_image() {
     # Create a disk image using dd
     verbose_log "Creating disk image of $SOURCE_DISK..."
     #don't pipe the output to pigz, instead create the image first and then compress it. This allows for better error handling and verification of the image before compression. conv=sync if piped to pigz could cause data loss if the pipe is broken or if pigz stutters. 
-    if ! printf '%s\n' "$SUDO_PWD" | sudo -S dd if="$SOURCE_DISK" of="${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}" bs=4M status=progress conv=noerror,sync iflag=noatime; then
+    # if ! printf '%s\n' "$SUDO_PWD" | sudo -S -p '' dd if="$SOURCE_DISK" of="${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}" bs=4M status=progress conv=noerror,sync iflag=noatime; then
+    #     verbose_log "Error: Failed to create disk image."
+    #     exit 1
+    # fi
+    if ! printf '%s\n' "$SUDO_PWD" | sudo -S -p '' ddrescue -f -n "$SOURCE_DISK" "${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}" "${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.ddrescue.log"; then
+        #FIXME handle the ddrescue log file in a better way, it require dedicated path and it needs to be transfered to the remote location too.
         verbose_log "Error: Failed to create disk image."
         exit 1
     fi
@@ -254,7 +278,7 @@ function check_mandatory_argument() {
 
 function verify_local_md5sum() {
     verbose_log "verifying the image file..."
-    local sum_source=$(printf '%s\n' "$SUDO_PWD" | sudo -S md5sum "${SOURCE_DISK}" | cut -d' ' -f1)
+    local sum_source=$(printf '%s\n' "$SUDO_PWD" | sudo -S -p '' md5sum "${SOURCE_DISK}" | cut -d' ' -f1)
     local sum_image=$(md5sum "${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}" | cut -d' ' -f1)
     verbose_log "MD5 checksum of the image file: $sum_image"
     verbose_log "MD5 checksum of the source disk: $sum_source"
@@ -272,28 +296,15 @@ function verify_remote_md5sum() {
     local remote_sum=$(ssh "$SSH_KEY_NAME" "md5sum '$DESTINATION_DIRECTORY/${IMAGE_NAME}.gz' | cut -d' ' -f1")
     local local_sum=$(md5sum "${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.gz" | cut -d' ' -f1)
     verbose_log "MD5 checksum of the remote archive file: ${remote_sum}"
-    #FIXME MD5 checksum of the remote archive file: 
+    # MD5 checksum of the remote archive file: 
     verbose_log "MD5 checksum of the local archive file: ${local_sum}"
-    #FIXME MD5 checksum of the local archive file:
+    # MD5 checksum of the local archive file:
     if [[ "$remote_sum" != "$local_sum" ]]; then
         verbose_log "Error: MD5 checksum verification failed. The transferred archive file may be corrupted."
         exit 1
     else
-
     verbose_log "MD5 checksum verification passed. The transferred archive file is valid."
     verbose_log "$SOURCE_DISK cloned successfully and archived successfully as ${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.gz at ${SSH_KEY_NAME} ${CONNECTION_CREDENTIALS}"
-
-        if rm "${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.gz"; then
-            echo "Local compressed image file deleted successfully: ${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.gz"
-        else
-            echo "Error: Failed to delete the local compressed image file: ${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.gz"
-        fi
-        
-        if rm "${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.log"; then
-            echo "Local log file deleted successfully: ${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.log"
-        else
-            echo "Error: Failed to delete the local log file: ${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.log"
-        fi
     fi
 
     
@@ -435,7 +446,7 @@ function verify_package() {
         if ! dpkg -s "$1" &> /dev/null; then
             cache_print "Warning: $1 is not installed. Attempting to install via apt..."
             echo "Warning: $1 is not installed. Attempting to install via apt..."
-            if ! sudo apt install "$1"; then
+            if ! printf '%s\n' "$SUDO_PWD" | sudo -S -p '' apt install "$1"; then
                 cache_print "Error: Failed to intall $1. Please install it manually and try again."
                                 echo "Error: Failed to intall $1. Please install it manually and try again."
 
@@ -525,8 +536,36 @@ EOF
     # fi
 }
 
+function unlock_source() {
+    printf '%s\n' "$SUDO_PWD" | sudo -S -p '' blockdev --setrw "$SOURCE_DISK" #to switch the device back to read-write mode.
+    echo "write permissions on $SOURCE_DISK have been restored"
+}
 
+function clean_local_files() {
+        if rm "${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.gz"; then
+            echo "Local compressed image file deleted successfully: ${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.gz"
+        else
+            echo "Error: Failed to delete the local compressed image file: ${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.gz"
+        fi
+        
+        if rm "${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.log"; then
+            echo "Local log file deleted successfully: ${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.log"
+        else
+            echo "Error: Failed to delete the local log file: ${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.log"
+        fi
 
+        if rm "${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.ddrescue.log"; then
+            echo "Local ddrescue log file deleted successfully: ${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.ddrescue.log"
+        else
+            echo "Error: Failed to delete the local log file: ${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.ddrescue.log"
+        fi
 
+        if rm "${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.ddrescue.log.bak"; then
+            echo "Local ddrescue log file deleted successfully: ${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.ddrescue.log.bak"
+        else
+            echo "Error: Failed to delete the local log file: ${LOCAL_IMAGE_DIRECTORY}/${IMAGE_NAME}.ddrescue.log.bak"
+        fi
+
+}
 
 main "$@" #keep at the very end of the script to ensure that the main function is executed when the script is run. 
