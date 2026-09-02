@@ -58,7 +58,7 @@ function main()  {
     verify_remote_md5sum  # verify the integrity of the transferred file by comparing md5 checksums of the local archive file and the remote archive file. If the checksums do not match, log the error and exit the script.
     clean_local_files
     
-    exit 1
+    exit 0
 }
 
 ### FUNCTIONS ###
