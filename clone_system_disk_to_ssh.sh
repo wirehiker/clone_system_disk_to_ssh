@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="0.2.2"
+SCRIPT_VERSION="0.2.4"
 
 function main()  {
     
@@ -58,7 +58,7 @@ function main()  {
     verify_remote_md5sum  # verify the integrity of the transferred file by comparing md5 checksums of the local archive file and the remote archive file. If the checksums do not match, log the error and exit the script.
     clean_local_files
     
-    exit 0
+    exit 1
 }
 
 ### FUNCTIONS ###
@@ -181,6 +181,7 @@ function parse_arguments() {
     SSH_HOST=$(check_mandatory_argument "$3" "SSH_HOST")
     CONNECTION_CREDENTIALS="$2@$3"  # combine SSH_USER and SSH_HOST into CONNECTION_CREDENTIALS
     DESTINATION_DIRECTORY=$(check_mandatory_argument "$4" "DESTINATION_DIRECTORY")
+    DESTINATION_DIRECTORY="${DESTINATION_DIRECTORY%/}" #if the destination directory ends with a slash, remove it to ensure no double slashes.
     if [[ "$UNSAFE" == true ]]; then
         IMAGE_NAME="${IMAGE_NAME:+${IMAGE_NAME}_}$(basename "$SOURCE_DISK")_${TIMESTAMP:+${TIMESTAMP}_}unsafe.img"  # default to the basename of SOURCE_DISK if not set by user
     else
@@ -188,6 +189,7 @@ function parse_arguments() {
     fi
     COMPRESSION_LEVEL="${COMPRESSION_LEVEL:-6}"  # default to 6 if not set
     LOCAL_IMAGE_DIRECTORY="${LOCAL_IMAGE_DIRECTORY:-$DESTINATION_DIRECTORY}"  # default to DESTINATION_DIRECTORY if not set
+    LOCAL_IMAGE_DIRECTORY="${LOCAL_IMAGE_DIRECTORY%/}" #remove trailing slash
     if [[ "$LOG" == true ]]; then
             LOCAL_LOG_FILE=$LOCAL_IMAGE_DIRECTORY/$IMAGE_NAME.log
             touch "$LOCAL_LOG_FILE"  # create the log file if it does not exist
@@ -476,8 +478,8 @@ function generate_ssh_key() {
     ssh_key_name="${ssh_key_name:-id_rsa}"
     ssh_key_path="$HOME/.ssh/$ssh_key_name"
 
-    # if the key already exists skeep the generating of a new key
-    if [[ -f "$ssh_key_path" || -f "${ssh_key_path}.pub" ]]; then
+    # if the key already exists skip the generating of a new key
+    if [[ -f "$ssh_key_path" && -f "${ssh_key_path}.pub" ]]; then
         verbose_log "SSH key already exists at $ssh_key_path."
         SSH_KEY_NAME="$ssh_key_name"
         return 0
